@@ -1,0 +1,552 @@
+{
+  "name": "Brokerage Transaction Agent",
+  "nodes": [
+    {
+      "id": "1",
+      "name": "Deal Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        100,
+        300
+      ],
+      "parameters": {
+        "path": "deal-event",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "responseNode": "Done"
+      }
+    },
+    {
+      "id": "2",
+      "name": "Init Context",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        300,
+        300
+      ],
+      "parameters": {
+        "functionCode": "const dealUuid = `${$execution.id}-${Date.now()}`;\nconst receivedAt = new Date().toISOString();\nitem.dealUuid = dealUuid;\nitem.receivedAt = receivedAt;\nconst missing = [];\nif(!item.dealId && !item.nlCommand) missing.push('dealId or nlCommand');\nif(!item.fileUrl && !item.nlCommand) missing.push('fileUrl or nlCommand');\nif(missing.length){\n  return [[], [{json: {status:'error', message:`missing ${missing.join(', ')}`}}]];\n}\nreturn [[item], [{json:{status:'queued', dealUuid}}]];",
+        "outputs": 2
+      }
+    },
+    {
+      "id": "3",
+      "name": "Classify Doc",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "functionCode": "const timelineStandardDays = parseInt($env.TIMELINE_STANDARD_DAYS || '45',10);\nitem.timelineStandardDays = timelineStandardDays;\nif(!item.docType && item.fileUrl){\n  const name = item.fileUrl.split('/').pop().toLowerCase();\n  if(name.includes('offer')) item.docType='offer';\n  else if(name.includes('counter')) item.docType='counter';\n  else if(name.includes('addendum')) item.docType='addendum';\n  else if(name.includes('executed')) item.docType='executed';\n  else item.docType='other';\n}\nconst docs=[];\nconst cmds=[];\nif(item.nlCommand) cmds.push(item); else docs.push(item);\nreturn [docs, cmds];",
+        "outputs": 2
+      }
+    },
+    {
+      "id": "4",
+      "name": "Fetch File",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        700,
+        100
+      ],
+      "notes": "SWAPPABLE: replace with native pCloud node when available",
+      "parameters": {
+        "url": "={{$json.fileUrl}}",
+        "responseFormat": "file"
+      }
+    },
+    {
+      "id": "5",
+      "name": "Parse PDF (Line Numbers)",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        900,
+        100
+      ],
+      "parameters": {
+        "functionCode": "const buf = $binary.data ? Buffer.from($binary.data.data, 'base64') : Buffer.from($json.content || '');\nconst text = buf.toString('utf8');\nconst lines = text.split(/\r?\n/).map((t,i)=>({lineNumber:i+1,text:t}));\nitem.parsedText = text;\nitem.lines = lines;\nreturn item;"
+      }
+    },
+    {
+      "id": "6",
+      "name": "Embeddings",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        100
+      ],
+      "notes": "OpenAI Embeddings (native)",
+      "parameters": {
+        "operation": "createEmbedding",
+        "model": "text-embedding-3-large",
+        "text": "={{$json.parsedText}}"
+      },
+      "credentials": {
+        "openAiApi": {
+          "name": "OpenAI Account"
+        }
+      }
+    },
+    {
+      "id": "7",
+      "name": "Upsert Chunks",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        100
+      ],
+      "notes": "Insert {deal_id, path, content, embedding} into docs via Supabase (native)",
+      "parameters": {
+        "operation": "upsert",
+        "table": "docs",
+        "data": "={{ [{deal_id: $json.dealId, path: $json.fileUrl, content: $json.parsedText, embedding: $json.data[0].embedding}] }}"
+      },
+      "credentials": {
+        "supabaseApi": {
+          "name": "Supabase"
+        }
+      }
+    },
+    {
+      "id": "8",
+      "name": "Similarity Search",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        100
+      ],
+      "notes": "Run similarity SQL via native Postgres node",
+      "parameters": {
+        "operation": "query",
+        "query": "select *, 1 - (embedding <=> $1::vector) as score from docs where deal_id = $2 order by embedding <=> $1::vector asc limit 20;",
+        "values": "={{ [JSON.stringify($json.data[0].embedding), $json.dealId] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "name": "Supabase Postgres"
+        }
+      }
+    },
+    {
+      "id": "9",
+      "name": "Timeline Validator",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1700,
+        100
+      ],
+      "parameters": {
+        "functionCode": "item.timelineFindings = [];\n// add timeline validations here\nreturn item;"
+      }
+    },
+    {
+      "id": "10",
+      "name": "Analyze",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [
+        1900,
+        100
+      ],
+      "notes": "OpenAI Chat (native) analyzes document",
+      "parameters": {
+        "operation": "chatCompletion",
+        "model": "gpt-4o-mini",
+        "messages": "={{[{role:'system',content:'You are a real estate contract analyst.'},{role:'user',content:JSON.stringify({docType:$json.docType, parsedText:$json.parsedText, timelineFindings:$json.timelineFindings, neighbors:$json})}]}}",
+        "responseFormat": "json"
+      },
+      "credentials": {
+        "openAiApi": {
+          "name": "OpenAI Account"
+        }
+      }
+    },
+    {
+      "id": "11",
+      "name": "Build Summary",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        2100,
+        100
+      ],
+      "parameters": {
+        "functionCode": "const issues = $json.choices ? JSON.parse($json.choices[0].message.content).issues : [];\nlet summary = `DocType: ${$json.docType}`;\nfor (const i of issues){summary += `\nLines ${i.lineStart}-${i.lineEnd}: ${i.reason}`;}\nitem.summary = summary;\nreturn item;"
+      }
+    },
+    {
+      "id": "12",
+      "name": "Post Message",
+      "type": "n8n-nodes-base.googleChat",
+      "typeVersion": 1,
+      "position": [
+        2300,
+        100
+      ],
+      "notes": "Posts summary card with Approve/Request Edits/Ask buttons calling /deal-action",
+      "parameters": {
+        "operation": "createMessage",
+        "text": "={{$json.summary}}",
+        "cards": "={{[{sections:[{widgets:[{textParagraph:{text:$json.summary}},{buttons:[{text:'Approve',onClick:{action:{actionMethodName:'approve',parameters:[{key:'dealUuid',value:$json.dealUuid}]}}},{text:'Request Edits',onClick:{action:{actionMethodName:'request_edits',parameters:[{key:'dealUuid',value:$json.dealUuid}]}}},{text:'Ask',onClick:{action:{actionMethodName:'ask',parameters:[{key:'dealUuid',value:$json.dealUuid}]}}}]}]}]}]}}"
+      },
+      "credentials": {
+        "googleChatOAuth2": {
+          "name": "Google Chat"
+        }
+      }
+    },
+    {
+      "id": "13",
+      "name": "Action Callback",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        100,
+        700
+      ],
+      "parameters": {
+        "path": "deal-action",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "responseNode": "Done"
+      }
+    },
+    {
+      "id": "14",
+      "name": "Branch on Action",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        300,
+        700
+      ],
+      "parameters": {
+        "functionCode": "const action = $json.action;\nif(action==='approve') return [[item], [], []];\nif(action==='request_edits') return [[], [item], []];\nreturn [[], [], [item]];",
+        "outputs": 3
+      }
+    },
+    {
+      "id": "15",
+      "name": "Draft Addendum/Counter",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        700,
+        500
+      ],
+      "parameters": {
+        "functionCode": "const text = $json.nlCommand || $json.notes || '';\nitem.draft = {text};\nreturn item;"
+      }
+    },
+    {
+      "id": "16",
+      "name": "Analyze (Draft QA)",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [
+        900,
+        500
+      ],
+      "notes": "OpenAI Chat (native) reviews generated draft",
+      "parameters": {
+        "operation": "chatCompletion",
+        "model": "gpt-4o-mini",
+        "messages": "={{[{role:'system',content:'Review the draft for issues.'},{role:'user',content:$json.draft.text}]}}",
+        "responseFormat": "json"
+      },
+      "credentials": {
+        "openAiApi": {
+          "name": "OpenAI Account"
+        }
+      }
+    },
+    {
+      "id": "17",
+      "name": "Post Message (Draft Review)",
+      "type": "n8n-nodes-base.googleChat",
+      "typeVersion": 1,
+      "position": [
+        2300,
+        500
+      ],
+      "parameters": {
+        "operation": "createMessage",
+        "text": "={{$json.summary || $json.draft.text}}"
+      },
+      "credentials": {
+        "googleChatOAuth2": {
+          "name": "Google Chat"
+        }
+      }
+    },
+    {
+      "id": "18",
+      "name": "Mark Processed",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        500,
+        700
+      ],
+      "parameters": {
+        "functionCode": "item.status='processed';\nreturn item;"
+      }
+    },
+    {
+      "id": "19",
+      "name": "Done",
+      "type": "n8n-nodes-base.httpResponse",
+      "typeVersion": 1,
+      "position": [
+        700,
+        700
+      ],
+      "parameters": {
+        "responseMode": "onReceived",
+        "responseBody": "={{$json}}"
+      }
+    }
+  ],
+  "connections": {
+    "Deal Trigger": {
+      "main": [
+        [
+          {
+            "node": "Init Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Context": {
+      "main": [
+        [
+          {
+            "node": "Classify Doc",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Doc": {
+      "main": [
+        [
+          {
+            "node": "Fetch File",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Draft Addendum/Counter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch File": {
+      "main": [
+        [
+          {
+            "node": "Parse PDF (Line Numbers)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse PDF (Line Numbers)": {
+      "main": [
+        [
+          {
+            "node": "Embeddings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings": {
+      "main": [
+        [
+          {
+            "node": "Upsert Chunks",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Similarity Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Chunks": {
+      "main": [
+        [
+          {
+            "node": "Similarity Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Similarity Search": {
+      "main": [
+        [
+          {
+            "node": "Timeline Validator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Timeline Validator": {
+      "main": [
+        [
+          {
+            "node": "Analyze",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze": {
+      "main": [
+        [
+          {
+            "node": "Build Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Summary": {
+      "main": [
+        [
+          {
+            "node": "Post Message",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Post Message (Draft Review)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Addendum/Counter": {
+      "main": [
+        [
+          {
+            "node": "Analyze (Draft QA)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze (Draft QA)": {
+      "main": [
+        [
+          {
+            "node": "Build Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Message (Draft Review)": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Action Callback": {
+      "main": [
+        [
+          {
+            "node": "Branch on Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Branch on Action": {
+      "main": [
+        [
+          {
+            "node": "Mark Processed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Draft Addendum/Counter",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Post Message (Draft Review)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Processed": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionMode": "queue",
+    "timezone": "America/Chicago"
+  },
+  "notes": "Schema: create table if not exists docs (id uuid primary key default gen_random_uuid(), deal_id text, path text, content text, embedding vector(3072), created_at timestamptz default now());\nSample payloads:\n1. {\"dealId\":\"123 Main St\", \"docType\":\"offer\", \"fileUrl\":\"https://example/pcloud/123-main/offer.pdf\"}\n2. {\"dealId\":\"123 Main St\", \"nlCommand\":\"draft addendum: extend inspection 3 days; increase EM by $5,000\"}\n3. {\"dealUuid\":\"abc-123\", \"action\":\"approve\"}\nAcceptance checklist: Uses native nodes (Google Chat, Supabase, Postgres, OpenAI); embeddings created with OpenAI and stored/searched via Supabase/Postgres; human-in-loop before external send; returns {status: \"queued\", dealUuid} on initial POST; imports on n8n >=1.50.\nSWAPPABLE: replace HTTP Request Fetch File with native pCloud node if available."
+}
